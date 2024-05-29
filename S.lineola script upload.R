@@ -1,8 +1,7 @@
 # R script for Oufiero et al. 2024
 #Oufiero, C.E., L. Garikipati, E. McMillan, M.K. Sullivan and R. Turnbaugh. Modulation of prey capture kinematics in relation to prey distance helps predict success. Journal of Experimental Biology. 
 #Analyses for dataset on S.lineola females (N=11) success/failure
-#on Mac
-setwd("/Users/coufiero/Library/CloudStorage/OneDrive-TowsonUniversity/Documents - Oufiero Lab/Analyses")
+
 
 
 data<-read.csv("Mantis 3D filming log.csv",nrows=240,stringsAsFactors=TRUE)
