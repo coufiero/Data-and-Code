@@ -1,0 +1,789 @@
+---
+title: "Garikipati EA 2025"
+author: "CEO"
+date: "2025-07-16"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "/Users/coufiero/Library/CloudStorage/OneDrive-TowsonUniversity/Documents - Oufiero Lab/Analyses")
+```
+
+# Overview
+This R Markdown includes the code for the analyses and figures associated with "Many to One Mapping in Mantodea: Camouflage Strategy and Phylogeny Drive Strike Variation in Prey Capture with Raptorial Forelegs"
+
+To run the code, the following datasets are needed:
+"Mantis.nex.txt" (from the Svenson and Whitting 2009 paper)
+"Lohit_Final_Log.csv"
+
+## Read in libraries
+
+```{r cars}
+library(phytools)
+library(geiger)
+library(MCMCglmm)
+library(tidyverse)
+library(caper)
+library(emmeans)
+library(MuMIn)
+library(vegan)
+```
+
+
+## Read in data files and transform variables
+
+```{r}
+tree<-read.nexus("Mantis.nex.txt")
+data<-read.csv("Lohit_Final_Log.csv")
+#take absolute values for tibia since it is a flexion resulting in a negative value
+data$abs_tibia_AV <-abs(data$Tibia_AV_min)
+data$abs_tibia_LV <-abs(data$Tibia_LV_min)
+data<-data[complete.cases(data[,16:95]), ]
+
+
+#trim rows for ecomorph and species, remove blank spaces
+data$Species <- trimws(data$Species) #trimws removes leading or trailing character space
+test_sp_df <- as.factor(data$Species)
+droplevels(test_sp_df, exclude = "")
+data$Species <- test_sp_df
+
+data$Ecomorph <- trimws(data$Ecomorph) #trimws removes leading or trailing character space
+test_eco_df <- as.factor(data$Ecomorph)
+droplevels(test_eco_df, exclude = "")
+data$Ecomorph <- test_eco_df
+
+#get three fastest strikes based upon tibia and femur angular velocities
+max.data <- data%>% group_by(Mantis) %>% arrange(desc(abs_tibia_AV), desc(Femur_AV)) %>%
+  slice(1:3) %>%
+  ungroup()
+ max.data<-as.data.frame(max.data) 
+
+#aggregate by species 
+data.1<-aggregate(max.data[,16:93], by=list(Tip.label=max.data$Phylo,max.data$Species),
+FUN=mean, na.rm=TRUE)
+#tree<-read.nexus("Mantis.nex.txt")
+colnames(data.1)[2] ="species"
+#prunning the tree to match morphology data
+row.names(data.1)<-data.1[,1]
+foo<-name.check(tree, data.1)
+print(foo)
+#remove tips from tree with no data
+tree.1<-drop.tip(tree, foo$tree_not_data)
+plot(tree.1)
+
+overlap <- name.check(tree.1, data=data.1)
+overlap 
+
+is_tip <- tree.1$edge[,2] <= length(tree.1$tip.label)
+ordered_tips <- tree.1$edge[is_tip, 2]
+tree.1$tip.label[ordered_tips]
+data.1<-data.1[tree.1$tip.label,]
+attach(data.1)
+name.check(tree.1, data.1)
+inv.phylo<-inverseA(tree.1,nodes="TIPS",scale=FALSE)
+prior2<-list(G=list(G1=list(V=1,nu=0.02),G2=list(V=1,nu=0.02)),
+   R=list(V=1,nu=0.02))
+
+  
+#morphology data
+morpho_df <- data.frame(max.data$Body_length, max.data$Tibia_length, max.data$Femur_Length, max.data$Coxa_length)
+
+#total data frame for final PCA includes 16 variables in this study
+total_df <- data.frame(max.data$Coxa_LV, max.data$Femur_LV, max.data$Coxa_AV, max.data $Femur_AV, max.data$abs_tibia_AV, max.data$abs_tibia_LV, max.data$Coxa.start, max.data$Approach.Time, max.data$PP_angle_st, max.data$PP_dist_cm_st, max.data$BD_veloc_cm.s, max.data$BD_dist_cm, max.data$TTPC.Sweep, max.data$CF_lateral_disp, max.data$FT_lateral_disp, max.data$tib_lateral_disp)
+
+
+```
+
+# Analyses
+
+## Principal Component Analysis on morphology based on 3 maximum attempts
+
+```{r}
+#morpho
+pca_morpho <- princomp(morpho_df, cor = TRUE)
+max.data$mPC1<-pca_morpho$scores[,1]  
+max.data$mPC2<-pca_morpho$scores[,2]
+summary(pca_morpho)
+```
+
+## PCA on 16 kinematic variable based on 3 maximum attempts
+```{r}
+pca_total <- princomp(total_df, cor = TRUE)
+sum.pca<-summary(pca_total)
+
+#loadings for each PC axis
+#pca_total$loadings
+kine_pca<-pca_total$loadings
+#unblock following to lines to save PCA loadings and summary
+#write.csv(kine_pca,"kine_pca.csv")
+#write.csv(sum.pca,"sum_pca.csv")
+
+bstick_total <- screeplot(x = pca_total, bstick = TRUE, type = c("barplot", "lines"),npcs = min(10, length(pca_total$sdev)), ptype = "o", bst.col = "red", bst.lty = "solid", xlab = "Component", ylab = "Inertia", main = deparse(substitute(pca_total))) 
+
+bstick_total
+max.data$total_PC1<-pca_total$scores[,1]
+max.data$total_PC2<-pca_total$scores[,2]
+max.data$total_PC3<-pca_total$scores[,3]
+```
+
+### PCA summary statistics and loadings for 16 kinematic traits
+```{r}
+#summary statistics to get proportional variances
+sum.pca
+
+#loadings for each PC axis
+pca_total$loadings
+```
+
+## PGLMM effects camouflage on morphology
+
+```{r}
+#aggregate by individual
+data.2<-aggregate(max.data[,16:100], by=list(max.data$Species,max.data$Phylo,max.data$Mantis,max.data$Ecomorph),
+FUN=mean, na.rm=TRUE)   
+colnames(data.2)[1] ="species"
+colnames(data.2)[2] ="phylo"
+colnames(data.2)[3] ="Mantis"
+colnames(data.2)[4] ="Ecomorph"
+   
+data.2$spec_mean_mPC1<-sapply(split(data.2$mPC1,data.2$phylo),mean)[data.2$phylo]
+data.2$within_spec_mPC1<-data.2$mPC1-data.2$spec_mean_mPC1       
+
+data.2$spec_mean_mPC2<-sapply(split(data.2$mPC2,data.2$phylo),mean)[data.2$phylo]
+data.2$within_spec_mPC2<-data.2$mPC2-data.2$spec_mean_mPC2
+```
+
+### Morpho PC1 reults
+
+```{r}
+#morpho PC1   
+model_mPC1<-MCMCglmm(mPC1~Ecomorph,
+    random=~phylo+species,family="gaussian",
+    ginverse=list(phylo=inv.phylo$Ainv),prior=prior2,data=data.2,
+    nitt=1000000,burnin=1000,thin=500,scale=TRUE,verbose=FALSE)
+  summary(model_mPC1)   
+m<-emmeans(model_mPC1,specs=~Ecomorph,data=data.2)
+summary(m,freq=TRUE)
+summary(pairs(m),freq=TRUE)
+#no differences
+#lambda Morpho PC 1
+lambda <- model_mPC1$VCV[,'phylo']/
+ (model_mPC1$VCV[,'phylo']+model_mPC1$VCV[,'species']+
+ model_mPC1$VCV[,'units'])
+#lambda Morpho PC 1
+mean(lambda)
+```
+
+### Morpho PC 2 results
+
+```{r}
+#Morpho PC2
+model_mPC2<-MCMCglmm(mPC2~Ecomorph,
+    random=~phylo+species,family="gaussian",
+    ginverse=list(phylo=inv.phylo$Ainv),prior=prior2,data=data.2,
+    nitt=1000000,burnin=1000,thin=500,scale=TRUE,verbose=FALSE)
+  summary(model_mPC2)
+m<-emmeans(model_mPC2,specs=~Ecomorph,data=data.2)
+summary(m,freq=TRUE)
+summary(pairs(m),freq=TRUE)
+#no differences
+lambda <- model_mPC2$VCV[,'phylo']/
+ (model_mPC2$VCV[,'phylo']+model_mPC2$VCV[,'species']+
+ model_mPC2$VCV[,'units'])
+#lambda Morpho PC 2
+mean(lambda)
+```
+
+## PGLMM effects camouflage and morphology PC 1-2 on Kinematic PC 1-3 
+
+### Kinematic PC 1
+```{r}
+model_kPC1<-MCMCglmm(total_PC1~Ecomorph+spec_mean_mPC1+within_spec_mPC1+spec_mean_mPC2+within_spec_mPC2,
+    random=~phylo+species,family="gaussian",
+    ginverse=list(phylo=inv.phylo$Ainv),prior=prior2,data=data.2,
+    nitt=1000000,burnin=1000,thin=500,scale=TRUE,verbose=FALSE)
+  summary(model_kPC1)   
+lambda <- model_kPC1$VCV[,'phylo']/
+ (model_kPC1$VCV[,'phylo']+model_kPC1$VCV[,'species']+
+ model_kPC1$VCV[,'units'])
+#lambda full model
+mean(lambda)
+
+
+model_kPC1.1<-MCMCglmm(mPC1~Ecomorph,
+    random=~phylo+species,family="gaussian",
+    ginverse=list(phylo=inv.phylo$Ainv),prior=prior2,data=data.2,
+    nitt=1000000,burnin=1000,thin=500, scale=TRUE,verbose=FALSE)
+  summary(model_kPC1.1)   
+m<-emmeans(model_kPC1.1,specs=~Ecomorph,data=data.2)
+summary(m,freq=TRUE)
+summary(pairs(m),freq=TRUE)
+
+ lambda <- model_kPC1.1$VCV[,'phylo']/
+ (model_kPC1.1$VCV[,'phylo']+model_kPC1.1$VCV[,'species']+
+ model_kPC1.1$VCV[,'units'])
+#lambda camouflage only
+ mean(lambda)
+
+```
+
+#### AICc comparison for K PC1 models
+
+```{r}
+AICc(model_kPC1,model_kPC1.1)
+```
+
+### Kinematic PC 2 
+```{r}
+model_kPC2<-MCMCglmm(total_PC2~Ecomorph+spec_mean_mPC1+within_spec_mPC1+spec_mean_mPC2+within_spec_mPC2,
+    random=~phylo+species,family="gaussian",
+    ginverse=list(phylo=inv.phylo$Ainv),prior=prior2,data=data.2,
+    nitt=1000000,burnin=1000,thin=500,scale=TRUE,verbose=FALSE)
+  summary(model_kPC2)   
+m<-emmeans(model_kPC2,specs=~Ecomorph,data=data.2)#working, but can't get p-value
+summary(m,freq=TRUE)
+summary(pairs(m),freq=TRUE)
+
+lambda <- model_kPC2$VCV[,'phylo']/
+ (model_kPC2$VCV[,'phylo']+model_kPC2$VCV[,'species']+
+ model_kPC2$VCV[,'units'])
+#lambda full model
+mean(lambda)
+  
+#use this model better fit based on AICc
+  model_kPC2.1<-MCMCglmm(total_PC2~Ecomorph,
+    random=~phylo+species,family="gaussian",
+    ginverse=list(phylo=inv.phylo$Ainv),prior=prior2,data=data.2,
+    nitt=1000000,burnin=1000,thin=500,scale=TRUE,verbose=FALSE)
+  summary(model_kPC2.1)  
+#significant if just ecomorph
+m<-emmeans(model_kPC2.1,specs=~Ecomorph,data=data.2)#working, but can't get p-value
+summary(m,freq=TRUE)
+summary(pairs(m),freq=TRUE)
+
+lambda <- model_kPC2.1$VCV[,'phylo']/
+ (model_kPC2.1$VCV[,'phylo']+model_kPC2.1$VCV[,'species']+
+ model_kPC2.1$VCV[,'units'])
+#lambbda camouflage only
+mean(lambda)
+
+
+
+```
+
+#### AICc comparison for K PC2 models
+
+```{r}
+AICc(model_kPC2,model_kPC2.1)
+```
+
+### Kinematic PC 3
+```{r}
+model_kPC3<-MCMCglmm(total_PC3~Ecomorph+spec_mean_mPC1+within_spec_mPC1+spec_mean_mPC2+within_spec_mPC2,
+    random=~phylo+species,family="gaussian",
+    ginverse=list(phylo=inv.phylo$Ainv),prior=prior2,data=data.2,
+    nitt=1000000,burnin=1000,thin=500,scale=TRUE,verbose=FALSE)
+  summary(model_kPC3)   
+m<-emmeans(model_kPC3,specs=~Ecomorph,data=data.2)
+summary(m,freq=TRUE)
+summary(pairs(m),freq=TRUE)
+lambda <- model_kPC3$VCV[,'phylo']/
+ (model_kPC3$VCV[,'phylo']+model_kPC3$VCV[,'species']+
+ model_kPC3$VCV[,'units'])
+#lambda Full model
+mean(lambda)
+
+model_kPC3.1<-MCMCglmm(total_PC3~Ecomorph,
+    random=~phylo+species,family="gaussian",
+    ginverse=list(phylo=inv.phylo$Ainv),prior=prior2,data=data.2,
+    nitt=1000000,burnin=1000,thin=500,scale=TRUE,verbose=FALSE)
+  summary(model_kPC3.1)   
+m<-emmeans(model_kPC3.1,specs=~Ecomorph,data=data.2)
+summary(m,freq=TRUE)
+summary(pairs(m),freq=TRUE)
+lambda <- model_kPC3.1$VCV[,'phylo']/
+ (model_kPC3.1$VCV[,'phylo']+model_kPC3.1$VCV[,'species']+
+ model_kPC3.1$VCV[,'units'])
+#lambda camouflage only
+mean(lambda)
+
+``` 
+
+#### AICc comparison for K PC3 models
+
+```{r}
+AICc(model_kPC3,model_kPC3.1)
+```
+# Figures
+
+## Data preparation
+```{r}
+#setting color
+dcol<-hcl.colors(4, palette="OrRd")   #dead leaf mimics, to make transparent add alpha=0.4
+fcol<-hcl.colors(7, palette="Purp") #flower mimics
+scol<-hcl.colors(5, palette="BrwnYl") #stick mimics
+gcol<-hcl.colors(7, palette="Emrld")  #generalists
+len<-nrow(max.data)
+
+max.data$col<-NA
+for (i in 1:len){
+	if(max.data$Species[i]=="Deroplatys truncata"){max.data$col[i]<-dcol[2]}
+	if(max.data$Species[i]=="Euchomenella heteroptera"){max.data$col[i]<-scol[1]}
+	if(max.data$Species[i]=="Hymenopus coronatus"){max.data$col[i]<-fcol[1]}
+	if(max.data$Species[i]=="Phyllocrania paradoxa"){max.data$col[i]<-dcol[1]}
+	if(max.data$Species[i]=="Pseudocreobotra wahlbergii"){max.data$col[i]<-fcol[3]}
+	if(max.data$Species[i]=="Pseudovates chlorophea"){max.data$col[i]<-scol[3]}
+	if(max.data$Species[i]=="Theopropus elegans"){max.data$col[i]<-fcol[5]}
+	if(max.data$Species[i]=="Stagmomantis limbata"){max.data$col[i]<-gcol[1]}
+	if(max.data$Species[i]=="Tenodera sinensis"){max.data$col[i]<-gcol[3]}
+  if(max.data$Species[i]=="Chopardiella pouliani"){max.data$col[i]<-gcol[5]}
+}	
+#this isn't working now?
+#setting shape
+max.data$sh<-NA
+for (i in 1:len){
+	if(max.data$Species[i]=="Deroplatys truncata"){max.data$sh[i]<-15}
+	if(max.data$Species[i]=="Euchomenella heteroptera"){max.data$sh[i]<-17}
+	if(max.data$Species[i]=="Hymenopus coronatus"){max.data$sh[i]<-18}
+	if(max.data$Species[i]=="Phyllocrania paradoxa"){max.data$sh[i]<-15}
+	if(max.data$Species[i]=="Pseudocreobotra wahlbergii"){max.data$sh[i]<-18}
+	if(max.data$Species[i]=="Pseudovates chlorophea"){max.data$sh[i]<-17}
+	if(max.data$Species[i]=="Theopropus elegans"){max.data$sh[i]<-18}
+	if(max.data$Species[i]=="Stagmomantis limbata"){max.data$sh[i]<-16}
+	if(max.data$Species[i]=="Tenodera sinensis"){max.data$sh[i]<-16}
+  if(max.data$Species[i]=="Chopardiella pouliani"){max.data$sh[i]<-16}
+}	
+
+data.1<-aggregate(max.data[,16:100], by=list(Tip.label=max.data$Phylo,max.data$Species,max.data$Ecomorph),
+FUN=mean, na.rm=TRUE) 
+colnames(data.1)[2] ="Species"
+colnames(data.1)[3] ="Ecomorph"
+
+
+data.1$Species <- trimws(data.1$Species)
+dcol<-hcl.colors(4, palette="OrRd")   #dead leaf mimics
+fcol<-hcl.colors(7, palette="Purp") #flower mimics
+scol<-hcl.colors(5, palette="BrwnYl") #stick mimics
+gcol<-hcl.colors(7, palette="Emrld")  #generalists
+len<-nrow(data.1)
+
+data.1$col<-NA
+for (i in 1:len){
+	if(data.1$Species[i]=="Deroplatys truncata"){data.1$col[i]<-dcol[2]}
+	if(data.1$Species[i]=="Euchomenella heteroptera"){data.1$col[i]<-scol[1]}
+	if(data.1$Species[i]=="Hymenopus coronatus"){data.1$col[i]<-fcol[1]}
+	if(data.1$Species[i]=="Phyllocrania paradoxa"){data.1$col[i]<-dcol[1]}
+	if(data.1$Species[i]=="Pseudocreobotra wahlbergii"){data.1$col[i]<-fcol[3]}
+	if(data.1$Species[i]=="Pseudovates chlorophea"){data.1$col[i]<-scol[3]}
+	if(data.1$Species[i]=="Theopropus elegans"){data.1$col[i]<-fcol[5]}
+	if(data.1$Species[i]=="Stagmomantis limbata"){data.1$col[i]<-gcol[1]}
+	if(data.1$Species[i]=="Tenodera sinensis"){data.1$col[i]<-gcol[3]}
+  if(data.1$Species[i]=="Chopardiella pouliani"){data.1$col[i]<-gcol[5]}
+}	
+
+#setting shape
+data.1$sh<-NA
+for (i in 1:len){
+	if(data.1$Species[i]=="Deroplatys truncata"){data.1$sh[i]<-22}
+	if(data.1$Species[i]=="Euchomenella heteroptera"){data.1$sh[i]<-24}
+	if(data.1$Species[i]=="Hymenopus coronatus"){data.1$sh[i]<-23}
+	if(data.1$Species[i]=="Phyllocrania paradoxa"){data.1$sh[i]<-22}
+	if(data.1$Species[i]=="Pseudocreobotra wahlbergii"){data.1$sh[i]<-23}
+	if(data.1$Species[i]=="Pseudovates chlorophea"){data.1$sh[i]<-24}
+	if(data.1$Species[i]=="Theopropus elegans"){data.1$sh[i]<-23}
+	if(data.1$Species[i]=="Stagmomantis limbata"){data.1$sh[i]<-21}
+	if(data.1$Species[i]=="Tenodera sinensis"){data.1$sh[i]<-21}
+  if(data.1$Species[i]=="Chopardiella pouliani"){data.1$sh[i]<-21}
+}	
+
+dcol<-hcl.colors(4, palette="OrRd",alpha=0.4)   #dead leaf mimics
+fcol<-hcl.colors(7, palette="Purp",alpha=0.4) #flower mimics
+scol<-hcl.colors(5, palette="BrwnYl",alpha=0.4) #stick mimics
+gcol<-hcl.colors(7, palette="Emrld",alpha=0.4)  #generalists
+len<-nrow(data.2)
+data.2$species <- trimws(data.2$species)
+data.2$col<-NA
+for (i in 1:len){
+	if(data.2$species[i]=="Deroplatys truncata"){data.2$col[i]<-dcol[2]}
+	if(data.2$species[i]=="Euchomenella heteroptera"){data.2$col[i]<-scol[1]}
+	if(data.2$species[i]=="Hymenopus coronatus"){data.2$col[i]<-fcol[1]}
+	if(data.2$species[i]=="Phyllocrania paradoxa"){data.2$col[i]<-dcol[1]}
+	if(data.2$species[i]=="Pseudocreobotra wahlbergii"){data.2$col[i]<-fcol[3]}
+	if(data.2$species[i]=="Pseudovates chlorophea"){data.2$col[i]<-scol[3]}
+	if(data.2$species[i]=="Theopropus elegans"){data.2$col[i]<-fcol[5]}
+	if(data.2$species[i]=="Stagmomantis limbata"){data.2$col[i]<-gcol[1]}
+	if(data.2$species[i]=="Tenodera sinensis"){data.2$col[i]<-gcol[3]}
+  if(data.2$species[i]=="Chopardiella pouliani"){data.2$col[i]<-gcol[5]}
+}	
+
+#setting shape
+data.2$sh<-NA
+for (i in 1:len){
+	if(data.2$species[i]=="Deroplatys truncata"){data.2$sh[i]<-22}
+	if(data.2$species[i]=="Euchomenella heteroptera"){data.2$sh[i]<-24}
+	if(data.2$species[i]=="Hymenopus coronatus"){data.2$sh[i]<-23}
+	if(data.2$species[i]=="Phyllocrania paradoxa"){data.2$sh[i]<-22}
+	if(data.2$species[i]=="Pseudocreobotra wahlbergii"){data.2$sh[i]<-23}
+	if(data.2$species[i]=="Pseudovates chlorophea"){data.2$sh[i]<-24}
+	if(data.2$species[i]=="Theopropus elegans"){data.2$sh[i]<-23}
+	if(data.2$species[i]=="Stagmomantis limbata"){data.2$sh[i]<-21}
+	if(data.2$species[i]=="Tenodera sinensis"){data.2$sh[i]<-21}
+  if(data.2$species[i]=="Chopardiella pouliani"){data.2$sh[i]<-21}
+}
+
+
+```
+
+## Figure 1: Phylogeny
+
+```{r}
+tree.1$tip.label[match(data.1$Tip.label, tree.1$tip.label)] <- data.1$Species
+rownames(data.1)<-data.1$Species
+is_tip <- tree.1$edge[,2] <= length(tree.1$tip.label)
+ordered_tips <- tree.1$edge[is_tip, 2]
+tree.1$tip.label[ordered_tips]
+
+data.1<-data.1[tree.1$tip.label,]
+attach(data.1)
+name.check(tree.1, data.1)
+
+#to save use code below
+#png(file="Mantis functional phylogeny 1.png", height=18, width=20, units="in",res=300)
+#pdf(file="Mantid functional phylogeny.pdf", height=10, width=20)
+
+#quartz(width=20, height=10)
+par(mar=c(5.1,8,4.1,2.1))
+plot(tree.1,edge.width=4,align.tip.label=FALSE,label.offset=0.005,cex=2, tip.color=data.1$col)
+#axisPhylo()
+tiplabels(tip=c(1:length(tree.1$tip.label)), pch=data.1$sh, bg=data.1$col,cex=4)
+points(0,10,pch=21,bg="black",cex=3)
+text(0.002,10,"Generalists",cex=1.5,pos=4)
+points(0,9.6,pch=22,bg="black",cex=3)
+text(0.002,9.6,"Dead Leaf",cex=1.5,pos=4)
+points(0,9.2,pch=23,bg="black",cex=3)
+text(0.002,9.2,"Flower",cex=1.5,pos=4)
+points(0,8.8,pch=24,bg="black",cex=3)
+text(0.002,8.8,"Stick",cex=1.5,pos=4)
+text(0.02,7.7, "Mantidae",cex=1.2)
+text(0.006,5.3, "Deroplatyidae",cex=1.2)
+text(0.0018,1.9, "Hymenopodidae",cex=1.2)
+#dev.off()
+```
+
+## Figure 2: Morphospace
+
+```{r}
+X<-cbind(data.1$mPC1,data.1$mPC2)
+  row.names(X)<-data.1$Species
+
+  #to save use code below
+#png(file="Ecomorph Morpho Space.png", height=12, width=14, units="in",res=300)
+par(mar=c(5.1,6,4.1,6.5))
+plot(data.1$mPC1,data.1$mPC2,col="white",xlim=c(-4,4),ylim=c(-3,3),xlab="Morphology PC1 (68%)",ylab="Morphology PC2 (28%)",cex.lab=2,cex.axis=1.5)
+phylomorphospace(tree.1,X[,1:2],lwd=3,label="off",node.size=0,add=TRUE)
+points(data.2$mPC1,data.2$mPC2,pch=data.2$sh,bg=data.2$col,cex=4)
+points(data.1$mPC1,data.1$mPC2,pch=data.1$sh,bg=data.1$col,cex=6)
+mtext("Smaller",side=1,at=-4,line=2.5,cex=1.5)
+mtext("Shorter coxa & femur",side=1,at=-4,line=3.5,cex=1.5)
+mtext("Larger ",side=1,at=4,line=2.5,cex=1.5)
+mtext("Longer coxa & femur",side=1,at=4,line=3.5,cex=1.5)
+mtext("Smaller",side=2,at=-2.5,line=3.5,cex=1.5)
+mtext("longer tibia",side=2,at=-2.5,line=2.5,cex=1.5)
+mtext("Larger",side=2,at=2.5,line=3.5,cex=1.5)
+mtext("shorter tibia",side=2,at=2.5,line=2.5,cex=1.5)
+
+#dev.off()
+
+```
+
+## Figure 3: Kinematic PC 1 and 2 with biplot
+
+```{r}
+layout_mat<-matrix(c(1,2,3,4,5,4), 2, 3, byrow = FALSE)
+#layout_mat
+my_layout<-layout(mat=layout_mat,widths=c(6,2,2), heights=c(4,4),respect=TRUE)
+#layout.show(my_layout)
+
+#to save use code below
+png(file="Fig. 3 Ecomorph Functional Space loadings.png", height=8, width=10, units="in",res=300)
+my_layout<-layout(mat=layout_mat,widths=c(6,2,2), heights=c(4,4),respect=TRUE)
+par(mar = c(5.1, 5.1, 0, 2))
+plot(max.data$total_PC1,max.data$total_PC2,pch=max.data$sh, cex=3,cex.lab=2,cex.axis=1.5,col=max.data$col,xlim=c(-4,4),ylim=c(-3,3),xlab="Kinematic PC1 (25.91%)",ylab="Kinematic PC2 (16.18%)",axes=FALSE)
+text(-4,3,"A",cex=3)
+axis(1)
+axis(2)
+#2 phylomorphospace
+X<-cbind(data.1$total_PC1,data.1$total_PC2)
+  row.names(X)<-data.1$Species
+par(mar=c(5.1,5.1,0,2))
+plot(data.1$total_PC1,data.1$total_PC2,col="white",xlim=c(-4,4),ylim=c(-3,3),xlab="Kinematic PC1 (25.91%)",ylab="Kinematic PC2 (16.18%)",cex.lab=2,cex.axis=1.5,axes=FALSE)
+phylomorphospace(tree.1,X[,1:2],lwd=3,label="off",node.size=0,add=TRUE)
+points(data.2$total_PC1,data.2$total_PC2,pch=data.2$sh,bg=data.2$col,cex=4)
+points(data.1$total_PC1,data.1$total_PC2,pch=data.1$sh,bg=data.1$col,cex=6)
+text(-4,3,"B",cex=3)
+axis(1)
+axis(2)
+#3 legend 1
+x<-c(1,10)
+y<-c(1,10)
+par(mar = c(0, 0, 0, 0))
+plot(x,y,col="white",xlim=c(-4,4),ylim=c(-3,3),xlab="",ylab="",axes=FALSE)
+unique_Species <- unique(max.data$Species)
+legend_label <- sapply(unique_Species, function(label) {
+  as.expression(substitute(italic(label), list(label=label)))
+})
+
+legend("center", 
+       legend = unique_Species,
+       pch = c(16, 16, 15, 17, 18, 17, 15, 18, 18, 16),
+       title = "Species", 
+       col = unique(max.data$col), pt.cex = 1,cex=1)
+
+
+#4 plot of just the loadings
+par(mar = c(5.1, 1, 1, 0))
+plot(pca_total$loadings[,1],pca_total$loadings[,2], xlim=c(-0.5,0.6),ylim=c(-0.2,0.6),col="white",axes=FALSE,ylab="",xlab="",main="Kinematic Contributions")
+axis(1)
+axis(2)
+ arrows(x0 = 0, x1 = pca_total$loadings[,1], 
+       y0 = 0, y1 = pca_total$loadings[,2], 
+       col = "red", 
+       length = 0.08, 
+       lwd = 1,
+       angle = 30)       
+labels<-c("Coxa LV","Femur LV","Coxa AV","Femur AV","Tibia AV", "Tibia LV","Coxa SA","Approach","PP Angle","PP Dist","BD Vel","BD Disp","Sweep", "CF Lat Disp", "FT Lat Disp","Tib Lat Disp")
+text(x = pca_total$loadings[,1], y = pca_total$loadings[,2], 
+     labels = labels, 
+     cex = 1,
+     font = 2,
+     col = "gray10", 
+     pos = c(4, 3, 2, 1, 3, 1))  
+ text(-0.4,0.6,"C",cex=3)     
+#5 second legend      
+par(mar = c(0, 0, 0, 0))
+plot(x,y,col="white",xlim=c(-4,4),ylim=c(-3,3),xlab="",ylab="",axes=FALSE)
+legend("center", 
+       legend = unique(max.data$Ecomorph), 
+       pch = unique(max.data$sh), cex=1,pt.cex=1)
+
+dev.off()
+
+```
+
+## Figure 4: Kinematic PC 1 and 3 with biplot
+
+```{r}
+layout_mat<-matrix(c(1,2,3,4,5,4), 2, 3, byrow = FALSE)
+#layout_mat
+my_layout<-layout(mat=layout_mat,widths=c(6,2,2), heights=c(4,4),respect=TRUE)
+#layout.show(my_layout)
+
+#to save use code below
+png(file="Fig. 4 Ecomorph Functional Space loadings.png", height=8, width=10, units="in",res=300)
+my_layout<-layout(mat=layout_mat,widths=c(6,2,2), heights=c(4,4),respect=TRUE)
+par(mar = c(5.1, 5.1, 0, 2))
+#1 all max attempts
+plot(max.data$total_PC1,max.data$total_PC3,pch=max.data$sh, cex=3,cex.lab=2,cex.axis=1.5,col=max.data$col,xlim=c(-4,4),ylim=c(-4,4),xlab="Kinematic PC1 (25.91%)",ylab="Kinematic PC3 (15.04%)",axes=FALSE)
+text(-4,4,"A",cex=3)
+axis(1)
+axis(2)
+
+#2 phylospace
+X<-cbind(data.1$total_PC1,data.1$total_PC3)
+  row.names(X)<-data.1$Species
+par(mar=c(5.1,5.1,0,2))
+plot(data.1$total_PC1,data.1$total_PC3,col="white",xlim=c(-4,4),ylim=c(-4,4),xlab="Kinematic PC1 (25.91%)",ylab="Kinematic PC3 (15.04%)",cex.lab=2,cex.axis=1.5,axes=FALSE)
+phylomorphospace(tree.1,X[,1:2],lwd=3,label="off",node.size=0,add=TRUE)
+points(data.2$total_PC1,data.2$total_PC3,pch=data.2$sh,bg=data.2$col,cex=4)
+points(data.1$total_PC1,data.1$total_PC3,pch=data.1$sh,bg=data.1$col,cex=6)
+text(-4,4,"B",cex=3)
+axis(1)
+axis(2)
+
+#3 legend 1
+x<-c(1,10)
+y<-c(1,10)
+par(mar = c(0, 0, 0, 0))
+plot(x,y,col="white",xlim=c(-4,4),ylim=c(-3,3),xlab="",ylab="",axes=FALSE)
+unique_Species <- unique(max.data$Species)
+legend_label <- sapply(unique_Species, function(label) {
+  as.expression(substitute(italic(label), list(label=label)))
+})
+
+legend("center", 
+       legend = unique_Species,
+       pch = c(16, 16, 15, 17, 18, 17, 15, 18, 18, 16),
+       title = "Species", 
+       col = unique(max.data$col), pt.cex = 1,cex=1)
+
+
+#3 plot of just the loadings
+par(mar = c(5.1, 1, 1, 0))
+plot(pca_total$loadings[,1],pca_total$loadings[,3], xlim=c(-0.5,0.6),ylim=c(-0.6,0.4),col="white",axes=FALSE,ylab="",xlab="",main="Kinematic Contributions")
+axis(1)
+axis(2)
+ arrows(x0 = 0, x1 = pca_total$loadings[,1], 
+       y0 = 0, y1 = pca_total$loadings[,3], 
+       col = "red", 
+       length = 0.08, 
+       lwd = 1,
+       angle = 30)       
+labels<-c("Coxa LV","Femur LV","Coxa AV","Femur AV","Tibia AV", "Tibia LV","Coxa SA","Approach","PP Angle","PP Dist","BD Vel","BD Disp","Sweep", "CF Lat Disp", "FT Lat Disp","Tib Lat Disp")
+text(x = pca_total$loadings[,1], y = pca_total$loadings[,3], 
+     labels = labels, 
+     cex = 1,
+     font = 2,
+     col = "gray10", 
+     pos = c(4, 3, 2, 1, 3, 1))  
+ text(-0.4,0.4,"C",cex=3)    
+#4 second legend      
+par(mar = c(0, 0, 0, 0))
+plot(x,y,col="white",xlim=c(-4,4),ylim=c(-3,3),xlab="",ylab="",axes=FALSE)
+legend("center", 
+       legend = unique(max.data$Ecomorph), 
+       pch = unique(max.data$sh), cex=1,pt.cex=1)
+
+dev.off()
+```
+
+## Figure 5: Coxa start differences
+
+```{r}
+
+#assign tip orders for y axis
+len<-nrow(data.2)
+
+for (i in 1:len){
+	if(data.2$species[i]=="Deroplatys truncata"){data.2$tip.order[i]<-6}
+	if(data.2$species[i]=="Euchomenella heteroptera"){data.2$tip.order[i]<-5}
+	if(data.2$species[i]=="Hymenopus coronatus"){data.2$tip.order[i]<-2}
+	if(data.2$species[i]=="Phyllocrania paradoxa"){data.2$tip.order[i]<-1}
+	if(data.2$species[i]=="Pseudocreobotra wahlbergii"){data.2$tip.order[i]<-4}
+	if(data.2$species[i]=="Pseudovates chlorophea"){data.2$tip.order[i]<-10}
+	if(data.2$species[i]=="Theopropus elegans"){data.2$tip.order[i]<-3}
+	if(data.2$species[i]=="Stagmomantis limbata"){data.2$tip.order[i]<-8}
+	if(data.2$species[i]=="Tenodera sinensis"){data.2$tip.order[i]<-7}
+  if(data.2$species[i]=="Chopardiella pouliani"){data.2$tip.order[i]<-9}
+}	
+
+len<-nrow(data.1)
+
+for (i in 1:len){
+	if(data.1$Species[i]=="Deroplatys truncata"){data.1$tip.order[i]<-6}
+	if(data.1$Species[i]=="Euchomenella heteroptera"){data.1$tip.order[i]<-5}
+	if(data.1$Species[i]=="Hymenopus coronatus"){data.1$tip.order[i]<-2}
+	if(data.1$Species[i]=="Phyllocrania paradoxa"){data.1$tip.order[i]<-1}
+	if(data.1$Species[i]=="Pseudocreobotra wahlbergii"){data.1$tip.order[i]<-4}
+	if(data.1$Species[i]=="Pseudovates chlorophea"){data.1$tip.order[i]<-10}
+	if(data.1$Species[i]=="Theopropus elegans"){data.1$tip.order[i]<-3}
+	if(data.1$Species[i]=="Stagmomantis limbata"){data.1$tip.order[i]<-8}
+	if(data.1$Species[i]=="Tenodera sinensis"){data.1$tip.order[i]<-7}
+  if(data.1$Species[i]=="Chopardiella pouliani"){data.1$tip.order[i]<-9}
+}
+
+#use code below to save
+#png(file="Fig. 6 coxa start.png", height=10, width=10, units="in",res=300)
+layout(matrix(c(1,1,2,2), 2, 2, byrow = FALSE ))
+par(mar=c(4, 1, 4, 0))
+plot(tree.1,edge.width=4,align.tip.label=FALSE,label.offset=0.01,cex=1.5, tip.color="black",adj=1)
+#axisPhylo()
+tiplabels(tip=c(1:length(tree.1$tip.label)), pch=data.1$sh, bg=data.1$col,cex=4)
+plot(data.1$Coxa.start,data.1$tip.order, pch=data.1$sh,bg=data.1$col,cex=6,xlim=c(10,115),ylab=" ",axes=FALSE,xlab="Coxa Start Angle (degrees)",cex.lab=1.5)
+points(data.2$Coxa.start,data.2$tip.order, pch=data.2$sh,bg=data.2$col,cex=2)
+axis(side=1,cex.axis=1.5)
+abline(v=50,lty="dashed")
+mtext("Basigrade", at=20)
+mtext("Anterograde", at=80)
+#dev.off()
+  
+	
+```
+
+## Figure S3: KPC1 extreme traits
+```{r}
+layout_mat<-matrix(c(1,1,2,3,4), 1, 5, byrow = FALSE)
+#extreme PC axes
+#use code below to save
+#png(file="Fig. 4 PC1 extremes.png", height=8, width=16, units="in",res=300)
+my_layout<-layout(mat=layout_mat,widths=c(3,3,5,5,5), heights=c(10,10),respect=TRUE)
+par(mar=c(4, 1, 4, 0))
+plot(tree.1,edge.width=4,align.tip.label=FALSE,label.offset=0.01,cex=1.8, tip.color="black",adj=1)
+#axisPhylo()
+tiplabels(tip=c(1:length(tree.1$tip.label)), pch=data.1$sh, bg=data.1$col,cex=4)
+plot(data.1$Femur_AV,data.1$tip.order, pch=data.1$sh,bg=data.1$col,cex=6,xlim=c(2000,11000),ylab=" ",axes=FALSE,xlab=expression(Femur~angular~vel.~(degrees~sec^1)),cex.lab=1.5)
+points(data.2$Femur_AV,data.2$tip.order, pch=data.2$sh,bg=data.2$col,cex=2)
+axis(side=1,cex.axis=1.5)
+segments(11000,0,11000,10)
+text(2100,10, "A)",cex=3)
+plot(data.1$abs_tibia_AV,data.1$tip.order, pch=data.1$sh,bg=data.1$col,cex=6,xlim=c(6000,17000),ylab=" ",axes=FALSE,xlab=expression(Tibia~angular~vel.~(degrees~sec^1)),cex.lab=1.5)
+points(data.2$abs_tibia_AV,data.2$tip.order, pch=data.2$sh,bg=data.2$col,cex=2)
+axis(side=1,cex.axis=1.5)
+segments(17000,0,17000,10)
+text(6000,10, "B)",cex=3)
+plot(data.1$BD_dist_cm,data.1$tip.order, pch=data.1$sh,bg=data.1$col,cex=6,xlim=c(0.2,2.5),ylab=" ",axes=FALSE,xlab=expression(Body~Displacement~(cm)),cex.lab=1.5)
+points(data.2$BD_dist_cm,data.2$tip.order, pch=data.2$sh,bg=data.2$col,cex=2)
+axis(side=1,cex.axis=1.5)
+text(0.25,10, "C)",cex=3)
+#dev.off()
+
+```
+
+## Figure S4: KPC2 extreme traits
+```{r}
+# approach, prey dist coxa and bd lv
+#use code below to save
+#png(file="Fig. 5 PC2 extremes.png", height=8, width=16, units="in",res=300)
+my_layout<-layout(mat=layout_mat,widths=c(3,3,5,5,5), heights=c(10,10),respect=TRUE)
+par(mar=c(4, 1, 4, 0))
+plot(tree.1,edge.width=4,align.tip.label=FALSE,label.offset=0.01,cex=1.8, tip.color="black",adj=1)
+#axisPhylo()
+tiplabels(tip=c(1:length(tree.1$tip.label)), pch=data.1$sh, bg=data.1$col,cex=4)
+plot(data.1$Approach.Time,data.1$tip.order, pch=data.1$sh,bg=data.1$col,cex=6,xlim=c(0.001,0.06),ylab=" ",axes=FALSE,xlab="Approach Time (sec.)",cex.lab=1.5)
+points(data.2$Approach.Time,data.2$tip.order, pch=data.2$sh,bg=data.2$col,cex=2)
+axis(side=1,cex.axis=1.5)
+segments(0.062,0,0.062,10)
+text(0.003,10, "A)",cex=3)
+plot(data.1$Coxa_LV,data.1$tip.order, pch=data.1$sh,bg=data.1$col,cex=6,xlim=c(40,170),ylab=" ",axes=FALSE,xlab=expression(Coxa~LV~(cm~s^-1)),cex.lab=1.5)
+points(data.2$Coxa_LV,data.2$tip.order, pch=data.2$sh,bg=data.2$col,cex=2)
+axis(side=1,cex.axis=1.5)
+segments(170,0,170,10)
+text(40,10, "B)",cex=3)
+plot(data.1$BD_veloc_cm.s,data.1$tip.order, pch=data.1$sh,bg=data.1$col,cex=6,xlim=c(13,90),ylab=" ",axes=FALSE,xlab=expression(Body~Velocity~(cm~s^-1)),cex.lab=1.5)
+points(data.2$BD_veloc_cm.s,data.2$tip.order, pch=data.2$sh,bg=data.2$col,cex=2)
+axis(side=1,cex.axis=1.5)
+text(14,10, "C)",cex=3)
+#dev.off()
+
+```
+
+## Figure S5: morphology vs. kinematics
+```{r}
+#use code below to save
+#png(file="Figure 7.png", height=10, width=16, units="in",res=300)
+layout(matrix(c(1,2,1,2), 2, 2, byrow = TRUE ))
+X<-cbind(data.1$mPC1,data.1$Coxa_LV)
+  row.names(X)<-data.1$Species
+par(mar=c(5.1,6,4.1,6.5))
+plot(data.1$mPC1,data.1$Coxa_LV,col="white",xlim=c(-4,4),ylim=c(40,170),xlab="Morphology PC1 (68%)",ylab=expression(Coxa~LV~(cm~s^-1)),cex.lab=2,cex.axis=1.5)
+phylomorphospace(tree.1,X[,1:2],lwd=3,label="off",node.size=0,add=TRUE)
+points(data.2$mPC1,data.2$Coxa_LV,pch=data.2$sh,bg=data.2$col,cex=4)
+points(data.1$mPC1,data.1$Coxa_LV,pch=data.1$sh,bg=data.1$col,cex=6)
+mtext("Longer coxa & femur",side=1,at=4,line=2.5,cex=1.2)
+mtext("A)",side=3,at=-4,line=1,cex=1.5)
+
+X<-cbind(data.1$mPC2,data.1$Coxa.start)
+  row.names(X)<-data.1$Species
+par(mar=c(5.1,6,4.1,6.5))
+plot(data.1$mPC2,data.1$Coxa.start,col="white",xlim=c(-3,3),ylim=c(10,115),xlab="Morphology PC2 (28%)",ylab="Coxa Start Angle (degrees)",cex.lab=2,cex.axis=1.5)
+phylomorphospace(tree.1,X[,1:2],lwd=3,label="off",node.size=0,add=TRUE)
+points(data.2$mPC2,data.2$Coxa.start,pch=data.2$sh,bg=data.2$col,cex=4)
+points(data.1$mPC2,data.1$Coxa.start,pch=data.1$sh,bg=data.1$col,cex=6)
+mtext("Longer tibia",side=1,at=-2.5,line=2.5,cex=1.2)
+mtext("B)",side=3,at=-3,line=1,cex=1.5)
+
+#dev.off()
+
+```
